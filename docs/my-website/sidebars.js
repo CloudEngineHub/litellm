@@ -172,7 +172,8 @@ const sidebars = {
         "tutorials/litellm_gemini_cli",
         "tutorials/google_genai_sdk",
         "tutorials/litellm_qwen_code_cli",
-        "tutorials/openai_codex"
+        "tutorials/openai_codex",
+        "tutorials/retool_assist"
       ]
     },
     {
@@ -814,6 +815,8 @@ const sidebars = {
         "providers/anyscale",
         "providers/apertis",
         "providers/baseten",
+        "providers/black_forest_labs",
+        "providers/black_forest_labs_img_edit",
         "providers/bytez",
         "providers/cerebras",
         "providers/chutes",
