@@ -297,14 +297,15 @@ def test_completion_azure():
         litellm.set_verbose = False
         ## Test azure call
         response = completion(
-            model="azure/gpt-4.1-mini",
+            model="azure_ai/gpt-4.1-mini",
+            api_base=os.getenv("AZURE_AI_API_BASE"),
             messages=[
                 {
                     "role": "user",
                     "content": "Hello, how are you?",
                 }
             ],
-            api_key="os.environ/AZURE_AI_API_KEY",
+            api_key=os.getenv("AZURE_AI_API_KEY"),
         )
         print(f"response: {response}")
         print(f"response hidden params: {response._hidden_params}")
@@ -477,7 +478,7 @@ async def test_azure_ai_model_router_streaming_cost_with_stream_options():
         response = await litellm.acompletion(
             model="azure_ai/azure-model-router",
             messages=[{"role": "user", "content": "hi"}],
-            api_base="https://ishaa-mh6uutut-swedencentral.cognitiveservices.azure.com/openai/v1/",
+            api_base=os.getenv("AZURE_MODEL_ROUTER_API_BASE"),
             api_key=os.getenv("AZURE_MODEL_ROUTER_API_KEY"),
             stream=True,
             stream_options={"include_usage": True},
