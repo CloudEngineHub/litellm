@@ -3567,6 +3567,148 @@ async def test_delete_mcp_oauth_user_credential_only_deletes_oauth():
 
 
 @pytest.mark.asyncio
+async def test_store_mcp_oauth_user_credential_invalidates_cached_token():
+    """Re-authorizing via the Tools-tab persist drops the v2 per-user token cache entry, so
+    egress stops serving the replaced token immediately instead of until its TTL."""
+    from litellm.proxy._types import MCPOAuthUserCredentialRequest
+
+    if not mgmt_endpoints.MCP_AVAILABLE:
+        pytest.skip("MCP module not installed")
+
+    from litellm.proxy._experimental.mcp_server import mcp_server_manager as manager_module
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+        store_mcp_oauth_user_credential,
+    )
+
+    server_id = "srv-inv-1"
+    user_id = "user-inv-1"
+    invalidate_mock = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
+            return_value=_make_prisma_client(),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_mcp_server",
+            new=AsyncMock(return_value=generate_mock_mcp_server_db_record(server_id=server_id)),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints._user_has_admin_view",
+            return_value=True,
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.store_user_oauth_credential",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_user_oauth_credential",
+            new=AsyncMock(return_value={"type": "oauth2", "access_token": "new-tok"}),
+        ),
+        patch.object(
+            manager_module.global_mcp_server_manager,
+            "invalidate_user_oauth_token_cache",
+            new=invalidate_mock,
+        ),
+    ):
+        await store_mcp_oauth_user_credential(
+            server_id=server_id,
+            payload=MCPOAuthUserCredentialRequest(access_token="new-tok", expires_in=3600),
+            user_api_key_dict=_make_user_auth(user_id),
+        )
+
+    invalidate_mock.assert_awaited_once_with(user_id, server_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_mcp_oauth_user_credential_invalidates_cached_token():
+    """Revoking a stored OAuth credential drops the v2 per-user token cache entry, so the
+    revoked token stops flowing upstream immediately instead of until its TTL."""
+    if not mgmt_endpoints.MCP_AVAILABLE:
+        pytest.skip("MCP module not installed")
+
+    from litellm.proxy._experimental.mcp_server import mcp_server_manager as manager_module
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+        delete_mcp_oauth_user_credential,
+    )
+
+    server_id = "srv-inv-2"
+    user_id = "user-inv-2"
+    invalidate_mock = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
+            return_value=_make_prisma_client(),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_user_oauth_credential",
+            new=AsyncMock(return_value={"type": "oauth2", "access_token": "revoked-tok"}),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.delete_user_credential",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(
+            manager_module.global_mcp_server_manager,
+            "invalidate_user_oauth_token_cache",
+            new=invalidate_mock,
+        ),
+    ):
+        result = await delete_mcp_oauth_user_credential(
+            server_id=server_id,
+            user_api_key_dict=_make_user_auth(user_id),
+        )
+
+    invalidate_mock.assert_awaited_once_with(user_id, server_id)
+    assert result.has_credential is False
+
+
+@pytest.mark.asyncio
+async def test_delete_mcp_oauth_user_credential_invalidates_when_record_already_gone():
+    """A concurrent delete can remove the row between the read and the delete; the cache may
+    still hold the revoked token, so the invalidate must fire even on RecordNotFoundError."""
+    if not mgmt_endpoints.MCP_AVAILABLE:
+        pytest.skip("MCP module not installed")
+
+    from litellm.proxy._experimental.mcp_server import mcp_server_manager as manager_module
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+        delete_mcp_oauth_user_credential,
+    )
+
+    server_id = "srv-inv-3"
+    user_id = "user-inv-3"
+    invalidate_mock = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
+            return_value=_make_prisma_client(),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_user_oauth_credential",
+            new=AsyncMock(return_value={"type": "oauth2", "access_token": "revoked-tok"}),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.delete_user_credential",
+            new=AsyncMock(side_effect=mgmt_endpoints.RecordNotFoundError({}, message="already gone")),
+        ),
+        patch.object(
+            manager_module.global_mcp_server_manager,
+            "invalidate_user_oauth_token_cache",
+            new=invalidate_mock,
+        ),
+    ):
+        result = await delete_mcp_oauth_user_credential(
+            server_id=server_id,
+            user_api_key_dict=_make_user_auth(user_id),
+        )
+
+    invalidate_mock.assert_awaited_once_with(user_id, server_id)
+    assert result.has_credential is False
+
+
+@pytest.mark.asyncio
 async def test_list_mcp_user_credentials_batch_server_fetch():
     """list_mcp_user_credentials uses a single batch DB call, not N+1 queries."""
     from litellm.proxy._types import MCPUserCredentialListItem
@@ -4992,3 +5134,93 @@ def test_stamp_oauth2_flow_ignores_non_oauth2():
     payload = _oauth2_create_payload(auth_type="none")
     mgmt_endpoints.stamp_omitted_oauth2_flow(payload)
     assert payload.oauth2_flow is None
+
+
+async def _run_edit(old_record, updated_record, purge_mock=None):
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import edit_mcp_server
+
+    server_id = updated_record.server_id
+    with (
+        patch("litellm.proxy.management_endpoints.mcp_management_endpoints.MCP_AVAILABLE", True),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.get_mcp_server",
+            AsyncMock(side_effect=old_record)
+            if isinstance(old_record, Exception)
+            else AsyncMock(return_value=old_record),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.update_mcp_server",
+            AsyncMock(return_value=updated_record),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.validate_and_normalize_mcp_server_payload",
+            autospec=True,
+        ),
+        patch("litellm.proxy.management_endpoints.mcp_management_endpoints.global_mcp_server_manager") as mock_manager,
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.purge_user_oauth_credentials_for_server",
+            purge_mock if purge_mock is not None else AsyncMock(return_value=1),
+        ) as mock_purge,
+    ):
+        mock_manager.update_server = AsyncMock()
+        mock_manager.reload_servers_from_database = AsyncMock()
+        payload = UpdateMCPServerRequest(server_id=server_id, alias=updated_record.alias, url=updated_record.url)
+        user_auth = UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN)
+        result = await edit_mcp_server(payload=payload, user_api_key_dict=user_auth)
+        return result, mock_purge
+
+
+@pytest.mark.asyncio
+async def test_edit_mcp_server_purges_user_tokens_on_mint_relevant_change():
+    server_id = str(uuid.uuid4())
+    old = generate_mock_mcp_server_db_record(server_id=server_id, url="https://old.example.com/mcp")
+    updated = generate_mock_mcp_server_db_record(server_id=server_id, url="https://new.example.com/mcp")
+
+    result, mock_purge = await _run_edit(old, updated)
+
+    assert result.server_id == server_id
+    mock_purge.assert_awaited_once()
+    assert mock_purge.await_args.args[1] == server_id
+
+
+@pytest.mark.asyncio
+async def test_edit_mcp_server_skips_purge_when_identity_unchanged():
+    server_id = str(uuid.uuid4())
+    old = generate_mock_mcp_server_db_record(server_id=server_id, alias="Before")
+    updated = generate_mock_mcp_server_db_record(server_id=server_id, alias="After")
+
+    result, mock_purge = await _run_edit(old, updated)
+
+    assert result.server_id == server_id
+    mock_purge.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_mcp_server_purge_failure_does_not_fail_the_edit():
+    """The purge is best-effort: a purge exception after a successful update must be swallowed and
+    logged, never turned into an error response for an edit whose primary job already succeeded."""
+    server_id = str(uuid.uuid4())
+    old = generate_mock_mcp_server_db_record(server_id=server_id, url="https://old.example.com/mcp")
+    updated = generate_mock_mcp_server_db_record(server_id=server_id, url="https://new.example.com/mcp")
+
+    result, mock_purge = await _run_edit(old, updated, purge_mock=AsyncMock(side_effect=RuntimeError("db down")))
+
+    assert result.server_id == server_id
+    mock_purge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_edit_mcp_server_snapshot_failure_skips_purge_but_edit_succeeds():
+    """The pre-update snapshot read is advisory (it only feeds the purge decision); a read failure
+    must skip the stale-token check with a warning, never fail the edit itself."""
+    server_id = str(uuid.uuid4())
+    updated = generate_mock_mcp_server_db_record(server_id=server_id, url="https://new.example.com/mcp")
+
+    result, mock_purge = await _run_edit(RuntimeError("db read failed"), updated)
+
+    assert result.server_id == server_id
+    mock_purge.assert_not_awaited()
