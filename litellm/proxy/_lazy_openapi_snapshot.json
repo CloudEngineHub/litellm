@@ -2357,6 +2357,20 @@
         },
         "AgentConfig": {
           "properties": {
+            "access_group_ids": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Access Group Ids"
+            },
             "agent_card_params": {
               "$ref": "#/components/schemas/AgentCard"
             },
@@ -2683,6 +2697,20 @@
         },
         "AgentResponse": {
           "properties": {
+            "access_group_ids": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Access Group Ids"
+            },
             "agent_card_params": {
               "additionalProperties": true,
               "title": "Agent Card Params",
@@ -3506,6 +3534,20 @@
         },
         "PatchAgentRequest": {
           "properties": {
+            "access_group_ids": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Access Group Ids"
+            },
             "agent_card_params": {
               "$ref": "#/components/schemas/AgentCard"
             },
@@ -15382,14 +15424,31 @@
               "title": "Jwt Issuer"
             },
             "key": {
-              "title": "Key",
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Key"
+            },
+            "token": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Token"
             }
           },
           "required": [
             "jwt_claim_name",
-            "jwt_claim_value",
-            "key"
+            "jwt_claim_value"
           ],
           "title": "CreateJWTKeyMappingRequest",
           "type": "object"
@@ -15553,6 +15612,17 @@
                 }
               ],
               "title": "Key"
+            },
+            "token": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Token"
             }
           },
           "required": [
@@ -20654,6 +20724,223 @@
             }
           ],
           "summary": "Openai Passthrough Route",
+          "tags": [
+            "llm_passthrough"
+          ]
+        }
+      },
+      "/openrouter/{endpoint}": {
+        "delete": {
+          "operationId": "openrouter_proxy_route_openrouter__endpoint__delete",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "endpoint",
+              "required": true,
+              "schema": {
+                "title": "Endpoint",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "security": [
+            {
+              "APIKeyHeader": []
+            }
+          ],
+          "summary": "Openrouter Proxy Route",
+          "tags": [
+            "llm_passthrough"
+          ]
+        },
+        "get": {
+          "operationId": "openrouter_proxy_route_openrouter__endpoint__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "endpoint",
+              "required": true,
+              "schema": {
+                "title": "Endpoint",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "security": [
+            {
+              "APIKeyHeader": []
+            }
+          ],
+          "summary": "Openrouter Proxy Route",
+          "tags": [
+            "llm_passthrough"
+          ]
+        },
+        "patch": {
+          "operationId": "openrouter_proxy_route_openrouter__endpoint__patch",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "endpoint",
+              "required": true,
+              "schema": {
+                "title": "Endpoint",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "security": [
+            {
+              "APIKeyHeader": []
+            }
+          ],
+          "summary": "Openrouter Proxy Route",
+          "tags": [
+            "llm_passthrough"
+          ]
+        },
+        "post": {
+          "operationId": "openrouter_proxy_route_openrouter__endpoint__post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "endpoint",
+              "required": true,
+              "schema": {
+                "title": "Endpoint",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "security": [
+            {
+              "APIKeyHeader": []
+            }
+          ],
+          "summary": "Openrouter Proxy Route",
+          "tags": [
+            "llm_passthrough"
+          ]
+        },
+        "put": {
+          "operationId": "openrouter_proxy_route_openrouter__endpoint__put",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "endpoint",
+              "required": true,
+              "schema": {
+                "title": "Endpoint",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "security": [
+            {
+              "APIKeyHeader": []
+            }
+          ],
+          "summary": "Openrouter Proxy Route",
           "tags": [
             "llm_passthrough"
           ]
@@ -34982,6 +35269,12 @@
         "PolicyAttachmentCreateRequest": {
           "description": "Request body for creating a policy attachment.",
           "properties": {
+            "default": {
+              "default": false,
+              "description": "Apply this attachment only when no non-default attachment matches the request.",
+              "title": "Default",
+              "type": "boolean"
+            },
             "keys": {
               "anyOf": [
                 {
@@ -35112,6 +35405,12 @@
               ],
               "description": "Who created the attachment.",
               "title": "Created By"
+            },
+            "default": {
+              "default": false,
+              "description": "Apply this attachment only when no non-default attachment matches the request.",
+              "title": "Default",
+              "type": "boolean"
             },
             "definition_location": {
               "default": "db",
@@ -37141,6 +37440,12 @@
         "PolicyAttachmentCreateRequest": {
           "description": "Request body for creating a policy attachment.",
           "properties": {
+            "default": {
+              "default": false,
+              "description": "Apply this attachment only when no non-default attachment matches the request.",
+              "title": "Default",
+              "type": "boolean"
+            },
             "keys": {
               "anyOf": [
                 {
