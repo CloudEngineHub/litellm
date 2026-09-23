@@ -96,6 +96,7 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/assemblyai/",
     "/eu.assemblyai/",
     "/deepgram/",
+    "/fal_ai/",
     "/langfuse/",
     "/vllm/",
     "/mistral/",
@@ -107,6 +108,7 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/cursor/",
     "/milvus/",
     "/openai_passthrough/",
+    "/tinyfish/",
     # Dynamic provider / toolset passthrough (path templates)
     "/{provider}/",
     "/toolset/",
@@ -129,6 +131,7 @@ GATEWAY_EXACT_PATHS: frozenset[str] = frozenset(
         "/redoc",
         "/test",
         "/debug/memory/summary",
+        "/api/event_logging/batch",
     }
 )
 

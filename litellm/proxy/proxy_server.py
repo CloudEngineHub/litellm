@@ -75,6 +75,11 @@ from litellm.constants import (
     RUNTIME_UPDATABLE_ROUTER_SETTINGS,
 )
 from litellm.litellm_core_utils.asyncify import asyncify
+from litellm.litellm_core_utils.bug_report import (
+    allowlisted,
+    bug_report_notice,
+    should_report_bug,
+)
 from litellm.litellm_core_utils.litellm_logging import (
     _init_custom_logger_compatible_class,
 )
@@ -127,6 +132,8 @@ from litellm.proxy.common_utils.callback_utils import (
     strip_callback_config,
 )
 from litellm.proxy.common_utils.realtime_utils import _realtime_request_body
+from litellm.proxy.management_helpers.auto_router_availability import AutoRouterCatalogEntry, build_auto_router_catalog
+from litellm.router_utils.access_windows import access_windows_config_error
 from litellm.router_utils.add_retry_fallback_headers import (
     get_fallback_errors_from_headers,
     get_hidden_params_dict,
@@ -304,6 +311,7 @@ from litellm.litellm_core_utils.core_helpers import (
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.realtime_errors import (
+    close_after_upstream_handshake_refusal,
     realtime_error_event,
     websocket_close_reason,
 )
@@ -367,10 +375,12 @@ from litellm.proxy.auth.user_api_key_auth import (
     user_api_key_auth_websocket,
 )
 from litellm.proxy.batches_endpoints.endpoints import router as batches_router
+from litellm.proxy.bug_report_config import build_proxy_bug_report
 
 ## Import All Misc routes here ##
 from litellm.proxy.caching_routes import router as caching_router
 from litellm.proxy.common_request_processing import (
+    KNOWN_PROXY_ROUTES,
     ProxyBaseLLMRequestProcessing,
     _is_azure_model_router_request,
     _should_return_raw_model_name,
@@ -587,6 +597,7 @@ from litellm.proxy.management_endpoints.key_management_endpoints import (
     delete_verification_tokens,
     duration_in_seconds,
     generate_key_helper_fn,
+    parse_key_alias_pattern,
 )
 from litellm.proxy.management_endpoints.key_management_endpoints import (
     router as key_management_router,
@@ -653,6 +664,9 @@ from litellm.proxy.memory.memory_endpoints import router as memory_router
 from litellm.proxy.middleware.billable_request_metrics_middleware import (
     BillableRequestMetricsMiddleware,
     BillingRecorder,
+)
+from litellm.proxy.middleware.budget_reservation_release_middleware import (
+    BudgetReservationReleaseMiddleware,
 )
 from litellm.proxy.plugin_routes import (
     register_plugins_from_config,
@@ -729,7 +743,10 @@ from litellm.proxy.shutdown.scheduled_jobs import (
     pause_scheduled_jobs,
     stop_in_flight_scheduler_jobs,
 )
-from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
+from litellm.proxy.spend_tracking.budget_reservation import (
+    get_budget_window_start,
+    release_unbound_budget_reservation,
+)
 from litellm.proxy.spend_tracking.daily_global_spend_rollup import (
     run_scheduled_daily_global_spend_reconcile,
 )
@@ -1481,23 +1498,29 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
     ## Initialize shared aiohttp session for connection reuse
     shared_aiohttp_session = await _initialize_shared_aiohttp_session()
 
-    model_info_scheduler: Final = scheduler if scheduler is not None else AsyncIOScheduler()
-    model_info_scheduler.add_job(
-        ProxyStartupEvent.refresh_model_info,
-        "interval",
-        seconds=MODEL_INFO_REFRESH_SECONDS,
-        id="refresh_model_info",
-        next_run_time=datetime.now(timezone.utc),
-        max_instances=1,
-        replace_existing=True,
+    model_info_refresh_disabled: Final = (
+        "disable_model_info_refresh" in general_settings and general_settings["disable_model_info_refresh"] is True
     )
-    if not model_info_scheduler.running:
-        model_info_scheduler.start()
+    model_info_scheduler: Final = (
+        None if model_info_refresh_disabled else scheduler if scheduler is not None else AsyncIOScheduler()
+    )
+    if model_info_scheduler is not None:
+        model_info_scheduler.add_job(
+            ProxyStartupEvent.refresh_model_info,
+            "interval",
+            seconds=MODEL_INFO_REFRESH_SECONDS,
+            id="refresh_model_info",
+            next_run_time=datetime.now(timezone.utc),
+            max_instances=1,
+            replace_existing=True,
+        )
+        if not model_info_scheduler.running:
+            model_info_scheduler.start()
 
     # End of startup event
     yield
 
-    if model_info_scheduler.running:
+    if model_info_scheduler is not None and model_info_scheduler.running:
         model_info_scheduler.remove_job("refresh_model_info")
         if model_info_scheduler is not scheduler:
             model_info_scheduler.shutdown(wait=False)
@@ -1958,7 +1981,21 @@ async def otel_request_validation_exception_handler(request: Request, exc: Reque
 async def otel_unhandled_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, (ProxyException, HTTPException, RequestValidationError)):
         raise exc
+    if PrismaDBExceptionHandler.is_database_service_unavailable_error_in_chain(exc):
+        verbose_proxy_logger.warning("Database unavailable during request: %s", type(exc).__name__)
+        return await openai_exception_handler(
+            request=request, exc=PrismaDBExceptionHandler.service_unavailable_proxy_exception(exc)
+        )
     verbose_proxy_logger.exception("Unhandled exception in request: %s", type(exc).__name__)
+    if should_report_bug(exc):
+        verbose_proxy_logger.error(
+            bug_report_notice(
+                build_proxy_bug_report(
+                    exc,
+                    call_type=allowlisted(request.url.path, KNOWN_PROXY_ROUTES),
+                )
+            )
+        )
     _close_dangling_otel_server_span(request, 500, exc=exc)
     return JSONResponse(
         status_code=500,
@@ -2358,6 +2395,7 @@ app.add_middleware(
     # it sees prisma_client as of the first request rather than import time.
     sink_factory=lambda: gateway_request_accumulator if prisma_client is not None else None,
 )
+app.add_middleware(BudgetReservationReleaseMiddleware, release=release_unbound_budget_reservation)
 app.add_middleware(InFlightRequestsMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -4818,6 +4856,22 @@ def validate_deployment_complexity_router_placement(model: Mapping[str, object])
         raise ValueError(f"model {model.get('model_name', '')!r}: {violation}")
 
 
+def validate_deployment_access_windows(model: Mapping[str, object]) -> None:
+    """
+    Reject a malformed `model_info.access_windows` instead of silently dropping the deployment.
+
+    Checked here rather than on `ModelInfo` because the proxy builds its router with
+    `ignore_invalid_deployments=True`, so a rejection further down turns a bad
+    deployment into a silently missing model instead of a refusal to start.
+    """
+    model_info: Final = model.get("model_info")
+    if not isinstance(model_info, Mapping):
+        return
+    error: Final = access_windows_config_error(model_info, model_name=str(model.get("model_name", "")))
+    if error is not None:
+        raise ValueError(error)
+
+
 def validate_auto_router_capability_limits(model_list: Sequence[Mapping[str, object]], *, limit: int | None) -> None:
     """
     Refuse to start when config.yaml defines more auto-routers claiming a licensed capability than allowed.
@@ -5015,6 +5069,7 @@ class ProxyConfig:
 
     def __init__(self) -> None:
         self.config: Mapping[str, object] = MappingProxyType({})
+        self.auto_router_db_catalog: tuple[AutoRouterCatalogEntry, ...] | None = None
         self._last_semantic_filter_config: dict[str, object] | None = None
         self._last_websearch_interception_config: dict[str, object] | None = None
         self._last_hashicorp_vault_config: dict[str, object] | None = None
@@ -6214,6 +6269,8 @@ class ProxyConfig:
                         litellm.upperbound_key_generate_params = LiteLLM_UpperboundKeyGenerateParams(**value)
                     else:
                         raise Exception(f"Invalid value set for upperbound_key_generate_params - value={value}")
+                elif key == "key_alias_pattern":
+                    litellm.key_alias_pattern = parse_key_alias_pattern(value)
                 elif key == "json_logs" and value is True:
                     litellm.json_logs = True
                     litellm._turn_on_json()
@@ -6518,6 +6575,7 @@ class ProxyConfig:
                         model["litellm_params"][k] = get_secret(v)
                 validate_deployment_max_agentic_loops(model)
                 validate_deployment_complexity_router_placement(model)
+                validate_deployment_access_windows(model)
                 pin_complexity_router_model_id(model)
                 complexity_router_config = model["litellm_params"].get("complexity_router_config")
                 if isinstance(complexity_router_config, dict):
@@ -7635,6 +7693,12 @@ class ProxyConfig:
     def _should_load_db_object(self, object_type: str | SupportedDBObjectType) -> bool:
         return should_load_db_object(object_type=object_type)
 
+    def remove_auto_router_catalog_entries(self, model_ids: frozenset[str]) -> None:
+        if self.auto_router_db_catalog is not None:
+            self.auto_router_db_catalog = tuple(
+                row for row in self.auto_router_db_catalog if row.model_id not in model_ids
+            )
+
     async def _get_models_from_db(self, prisma_client: PrismaClient) -> Sequence[_ProxyModelRow] | None:
         """
         Fetch all model deployments from the DB.
@@ -7655,6 +7719,7 @@ class ProxyConfig:
             new_models: Final[Sequence[_ProxyModelRow]] = await ModelRepository(
                 WriterPinnedClient(prisma_client.db)
             ).table.find_many()
+            self.auto_router_db_catalog = build_auto_router_catalog(new_models)
             return new_models
         except Exception as e:
             verbose_proxy_logger.exception(
@@ -12479,9 +12544,9 @@ async def realtime_websocket_endpoint(
             user_model=user_model,
         )
         await llm_call
-    except websockets.exceptions.InvalidStatusCode as e:
+    except websockets.exceptions.InvalidStatus as e:
         verbose_proxy_logger.exception("Invalid status code")
-        await websocket.close(code=e.status_code, reason="Invalid status code")
+        await close_after_upstream_handshake_refusal(websocket, e.response.status_code)
     except Exception as e:
         verbose_proxy_logger.exception("Internal server error")
         redacted_error: Final = _redact_string(str(e))

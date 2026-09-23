@@ -29,6 +29,7 @@ from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
+    _fal_target,
     _join_url_paths,
     _proxy_general_settings,
     anthropic_proxy_route,
@@ -38,6 +39,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     bedrock_proxy_route,
     create_pass_through_route,
     cursor_proxy_route,
+    fal_ai_proxy_route,
     get_azure_ai_search_index_from_endpoint,
     get_vertex_base_url,
     is_azure_ai_search_service_level_index_create,
@@ -7117,6 +7119,159 @@ class TestTypeSafePassthroughRoute:
         )
 
 
+class TestFalAIPassthroughRoute:
+    @pytest.fixture
+    def client(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+        from litellm.proxy.proxy_server import app
+
+        monkeypatch.setenv("FAL_AI_API_KEY", "fal-test-key")
+        monkeypatch.delenv("FAL_AI_QUEUE_API_BASE", raising=False)
+        monkeypatch.delenv("SERVER_ROOT_PATH", raising=False)
+        monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+        litellm.in_memory_llm_clients_cache.flush_cache()
+        monkeypatch.setitem(app.dependency_overrides, user_api_key_auth, lambda: UserAPIKeyAuth(api_key="sk-virtual"))
+        yield TestClient(app)
+
+    def test_submit_forwards_body_and_key_scheme_to_queue_fal_run(self, client: TestClient) -> None:
+        body: Final = {"image_url": "https://example.com/in.png", "resolution": 1536}
+        with respx.mock(assert_all_called=True) as upstream:
+            route = upstream.post("https://queue.fal.run/fal-ai/trellis-2").mock(
+                return_value=httpx.Response(200, json={"request_id": "req-1", "status": "IN_QUEUE"})
+            )
+            response = client.post("/fal_ai/fal-ai/trellis-2", json=body)
+
+            assert response.status_code == 200, response.text
+            assert response.json() == {"request_id": "req-1", "status": "IN_QUEUE"}
+            sent = route.calls.last.request
+            assert sent.headers["authorization"] == "Key fal-test-key"
+            assert json.loads(sent.content or b"{}") == body
+
+    def test_status_get_forwards_to_queue_fal_run(self, client: TestClient) -> None:
+        with respx.mock(assert_all_called=True) as upstream:
+            route = upstream.get("https://queue.fal.run/fal-ai/trellis-2/requests/req-1/status").mock(
+                return_value=httpx.Response(200, json={"status": "COMPLETED"})
+            )
+            response = client.get("/fal_ai/fal-ai/trellis-2/requests/req-1/status")
+
+            assert response.status_code == 200, response.text
+            assert response.json() == {"status": "COMPLETED"}
+            assert route.calls.last.request.headers["authorization"] == "Key fal-test-key"
+
+    def test_honours_fal_ai_queue_api_base_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FAL_AI_API_KEY", "fal-test-key")
+        monkeypatch.setenv("FAL_AI_QUEUE_API_BASE", "https://queue.example/base")
+        endpoint_func = AsyncMock(return_value={"ok": True})
+        create_route = Mock(return_value=endpoint_func)
+        monkeypatch.setattr(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+            create_route,
+        )
+        request = MagicMock(spec=Request)
+        request.method = "POST"
+        request.query_params = {}
+        request.json = AsyncMock(return_value={})
+
+        result = asyncio.run(
+            fal_ai_proxy_route(
+                endpoint="fal-ai/trellis",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=UserAPIKeyAuth(api_key="virtual-key"),
+            )
+        )
+
+        assert result == {"ok": True}
+        create_route.assert_called_once_with(
+            endpoint="fal-ai/trellis",
+            target="https://queue.example/base/fal-ai/trellis",
+            custom_headers={"Authorization": "Key fal-test-key"},
+            custom_llm_provider="fal_ai",
+            is_streaming_request=False,
+        )
+
+    def test_submit_to_unpriced_endpoint_returns_400_without_upstream_call(self, client: TestClient) -> None:
+        with respx.mock(assert_all_called=False) as upstream:
+            route = upstream.post("https://queue.fal.run/fal-ai/unpriced-model").mock(
+                return_value=httpx.Response(200, json={"request_id": "req-1"})
+            )
+            response = client.post("/fal_ai/fal-ai/unpriced-model", json={"image_url": "https://example.com/in.png"})
+
+            assert response.status_code == 400, response.text
+            assert "no pricing entry" in response.text
+            assert not route.calls
+
+    def test_submit_to_catalog_key_the_pricer_cannot_price_returns_400_without_upstream_call(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "fal_ai/fal-ai/priceless-model",
+            {"litellm_provider": "fal_ai", "mode": "image_generation"},
+        )
+        with respx.mock(assert_all_called=False) as upstream:
+            route = upstream.post("https://queue.fal.run/fal-ai/priceless-model").mock(
+                return_value=httpx.Response(200, json={"request_id": "req-1"})
+            )
+            response = client.post("/fal_ai/fal-ai/priceless-model", json={"image_url": "https://example.com/in.png"})
+
+            assert response.status_code == 400, response.text
+            assert "no pricing entry" in response.text
+            assert not route.calls
+
+    def test_submit_gate_prices_the_request_body_not_an_empty_one(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "fal_ai/fal-ai/keyed-only-model",
+            {"litellm_provider": "fal_ai", "mode": "image_generation", "output_cost_per_image_512": 0.02},
+        )
+        with respx.mock(assert_all_called=False) as upstream:
+            route = upstream.post("https://queue.fal.run/fal-ai/keyed-only-model").mock(
+                return_value=httpx.Response(200, json={"request_id": "req-1"})
+            )
+            priced = client.post(
+                "/fal_ai/fal-ai/keyed-only-model", json={"image_url": "https://example.com/in.png", "resolution": "512"}
+            )
+            unpriced = client.post("/fal_ai/fal-ai/keyed-only-model", json={"image_url": "https://example.com/in.png"})
+
+            assert priced.status_code == 200, priced.text
+            assert unpriced.status_code == 400, unpriced.text
+            assert "no pricing entry" in unpriced.text
+            assert len(route.calls) == 1
+
+    def test_status_get_on_unpriced_endpoint_forwards(self, client: TestClient) -> None:
+        with respx.mock(assert_all_called=True) as upstream:
+            upstream.get("https://queue.fal.run/fal-ai/unpriced-model/requests/req-9/status").mock(
+                return_value=httpx.Response(200, json={"status": "IN_PROGRESS"})
+            )
+            response = client.get("/fal_ai/fal-ai/unpriced-model/requests/req-9/status")
+
+            assert response.status_code == 200, response.text
+            assert response.json() == {"status": "IN_PROGRESS"}
+
+    def test_missing_fal_key_returns_401(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FAL_AI_API_KEY", raising=False)
+        response = client.post("/fal_ai/fal-ai/trellis", json={})
+        assert response.status_code == 401
+
+
+class TestFalTargetSelection:
+    def test_endpoint_targets_queue_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FAL_AI_QUEUE_API_BASE", raising=False)
+        assert str(_fal_target("fal-ai/trellis-2")) == "https://queue.fal.run/fal-ai/trellis-2"
+
+    def test_status_path_targets_queue_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FAL_AI_QUEUE_API_BASE", raising=False)
+        assert str(_fal_target("fal-ai/trellis-2/requests/req-1/status")) == (
+            "https://queue.fal.run/fal-ai/trellis-2/requests/req-1/status"
+        )
+
+    def test_queue_base_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FAL_AI_QUEUE_API_BASE", "https://queue.example/base")
+        assert str(_fal_target("fal-ai/trellis-2")) == "https://queue.example/base/fal-ai/trellis-2"
+
+
 class TestOpenRouterPassthroughRoute:
     @staticmethod
     def _request(body: object, query_params: Mapping[str, str] | None = None) -> MagicMock:
@@ -7256,3 +7411,200 @@ class TestOpenRouterPassthroughRoute:
         )
 
         assert create_route.call_args.kwargs["target"] == f"{expected_root}/{endpoint}"
+
+
+class TestTinyFishProxyRoute:
+    """Tests for the TinyFish Agent pass-through route, faking the upstream HTTP boundary."""
+
+    RUN_BODY = {"url": "https://scrapeme.live/shop", "goal": "Extract the first 2 product names. Return JSON."}
+
+    @pytest.fixture
+    def tinyfish_client(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+        from litellm.proxy.proxy_server import app
+
+        monkeypatch.setenv("TINYFISH_API_KEY", "sk-tf-upstream")
+        monkeypatch.delenv("TINYFISH_AGENT_API_BASE", raising=False)
+        monkeypatch.delenv("TINYFISH_ALLOW_AUTHENTICATED_RUNS", raising=False)
+        monkeypatch.delenv("SERVER_ROOT_PATH", raising=False)
+        monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+        litellm.in_memory_llm_clients_cache.flush_cache()
+        monkeypatch.setitem(app.dependency_overrides, user_api_key_auth, lambda: UserAPIKeyAuth(api_key="sk-virtual"))
+        yield TestClient(app)
+
+    def test_forwards_run_with_server_key_not_callers(self, tinyfish_client: TestClient) -> None:
+        with respx.mock(assert_all_called=True) as upstream:
+            route = upstream.post("https://agent.tinyfish.ai/v1/automation/run").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-1", "status": "COMPLETED", "num_of_steps": 2})
+            )
+            response = tinyfish_client.post(
+                "/tinyfish/v1/automation/run", json=self.RUN_BODY, headers={"X-API-Key": "sk-callers-virtual-key"}
+            )
+
+        assert (response.status_code, response.json()["run_id"]) == (200, "run-1")
+        assert route.calls.last.request.headers["x-api-key"] == "sk-tf-upstream"
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/tinyfish/v1/vault/items"),
+            ("GET", "/tinyfish/v1/wallet"),
+            ("POST", "/tinyfish/v1/browser-profiles"),
+            ("GET", "/tinyfish/v1/automation/run"),
+            ("GET", "/tinyfish/v1/runs"),
+        ],
+    )
+    def test_blocks_endpoints_outside_allowlist(self, tinyfish_client: TestClient, method: str, path: str) -> None:
+        with respx.mock:
+            response = tinyfish_client.request(method, path)
+
+        assert response.status_code == 403
+        assert "not an allowed TinyFish Agent passthrough endpoint" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/tinyfish/v1/automation/run/",
+            "/tinyfish/v1/automation/run-async/",
+            "/tinyfish/v1/automation/run-sse/",
+            "/tinyfish/v1//automation/run-async",
+        ],
+    )
+    def test_submit_paths_with_extra_slashes_are_rejected_before_forwarding(
+        self, tinyfish_client: TestClient, path: str
+    ) -> None:
+        with respx.mock(assert_all_called=False) as upstream:
+            upstream.post(url__regex=r"https://agent\.tinyfish\.ai/.*").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-slash", "status": "PENDING"})
+            )
+            response = tinyfish_client.post(path, json=self.RUN_BODY)
+
+        assert response.status_code == 403
+        assert "not an allowed TinyFish Agent passthrough endpoint" in response.json()["detail"]
+        assert upstream.calls.call_count == 0
+
+    def test_rejects_authenticated_run_fields_by_default(self, tinyfish_client: TestClient) -> None:
+        with respx.mock:
+            response = tinyfish_client.post("/tinyfish/v1/automation/run", json={**self.RUN_BODY, "use_vault": True})
+
+        assert response.status_code == 403
+        assert "use_vault" in response.json()["detail"]
+
+    def test_env_opt_in_allows_authenticated_run_fields(
+        self, tinyfish_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TINYFISH_ALLOW_AUTHENTICATED_RUNS", "true")
+
+        with respx.mock(assert_all_called=True) as upstream:
+            route = upstream.post("https://agent.tinyfish.ai/v1/automation/run").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-2", "status": "COMPLETED", "num_of_steps": 1})
+            )
+            response = tinyfish_client.post("/tinyfish/v1/automation/run", json={**self.RUN_BODY, "use_vault": True})
+
+        assert response.status_code == 200
+        assert json.loads(route.calls.last.request.content)["use_vault"] is True
+
+    def test_returns_401_on_missing_api_key(
+        self, tinyfish_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("TINYFISH_API_KEY")
+
+        with respx.mock:
+            response = tinyfish_client.get("/tinyfish/v1/runs/run-123")
+
+        assert response.status_code == 401
+        assert "TINYFISH_API_KEY" in response.json()["detail"]
+
+    def test_env_base_override_changes_target(
+        self, tinyfish_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TINYFISH_AGENT_API_BASE", "https://agent.staging.tinyfish.ai")
+
+        with respx.mock(assert_all_called=True) as upstream:
+            upstream.get("https://agent.staging.tinyfish.ai/v1/runs/run-123").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-123", "status": "RUNNING"})
+            )
+            response = tinyfish_client.get("/tinyfish/v1/runs/run-123")
+
+        assert (response.status_code, response.json()["status"]) == (200, "RUNNING")
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"custom_body": {"url": "https://scrapeme.live/shop", "goal": "g", "use_vault": True}},
+            {"url": "https://scrapeme.live/shop", "goal": "g", "stream": True},
+            {"url": "https://scrapeme.live/shop", "goal": "g", "query_params": {"x": "1"}},
+        ],
+    )
+    def test_rejects_passthrough_envelope_controls(self, tinyfish_client: TestClient, body: dict) -> None:
+        """custom_body smuggled vault fields past the 403 gate and a stream flag flipped the
+        billing mode, because the generic passthrough honors both from the caller's body."""
+        with respx.mock as upstream:
+            route = upstream.post("https://agent.tinyfish.ai/v1/automation/run").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-1", "status": "COMPLETED", "num_of_steps": 1})
+            )
+            response = tinyfish_client.post("/tinyfish/v1/automation/run", json=body)
+
+        assert response.status_code == 400
+        assert "envelope" in response.json()["detail"]
+        assert not route.called
+
+    def test_rejects_envelope_stream_on_cancel(self, tinyfish_client: TestClient) -> None:
+        with respx.mock as upstream:
+            route = upstream.post("https://agent.tinyfish.ai/v1/runs/run-1/cancel").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-1", "status": "CANCELLED"})
+            )
+            response = tinyfish_client.post("/tinyfish/v1/runs/run-1/cancel", json={"stream": True})
+
+        assert response.status_code == 400
+        assert not route.called
+
+    @pytest.mark.parametrize(
+        "content,content_type",
+        [
+            ("url=https%3A%2F%2Fscrapeme.live%2Fshop&goal=g&stream=true", "application/x-www-form-urlencoded"),
+            ("url=https%3A%2F%2Fscrapeme.live%2Fshop&goal=g&use_vault=true", "application/x-www-form-urlencoded"),
+            ('{"url": "https://scrapeme.live/shop", "goal": "g", "use_vault": true}', "text/plain"),
+            ('[{"url": "https://scrapeme.live/shop", "goal": "g", "stream": true}]', "application/json"),
+        ],
+    )
+    def test_rejects_bodies_that_are_not_json_objects(
+        self, tinyfish_client: TestClient, content: str, content_type: str
+    ) -> None:
+        """A form-encoded body carried stream and use_vault past both field gates, because
+        the gates only saw fields the body parsed to as JSON."""
+        with respx.mock as upstream:
+            route = upstream.post("https://agent.tinyfish.ai/v1/automation/run").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-1", "status": "COMPLETED", "num_of_steps": 1})
+            )
+            response = tinyfish_client.post(
+                "/tinyfish/v1/automation/run", content=content, headers={"Content-Type": content_type}
+            )
+
+        assert response.status_code == 400
+        assert "JSON object" in response.json()["detail"]
+        assert not route.called
+
+    def test_cancel_without_body_forwards(self, tinyfish_client: TestClient) -> None:
+        with respx.mock(assert_all_called=True) as upstream:
+            upstream.post("https://agent.tinyfish.ai/v1/runs/run-1/cancel").mock(
+                return_value=httpx.Response(200, json={"run_id": "run-1", "status": "CANCELLED"})
+            )
+            response = tinyfish_client.post("/tinyfish/v1/runs/run-1/cancel")
+
+        assert (response.status_code, response.json()["status"]) == (200, "CANCELLED")
+
+
+class TestTinyFishRouteTimeout:
+    def test_default_covers_upstream_run_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from litellm.proxy import proxy_server
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import _tinyfish_route_timeout
+
+        monkeypatch.setattr(proxy_server, "general_settings", {}, raising=False)
+        assert _tinyfish_route_timeout() == 1500.0
+
+    def test_operator_configured_timeout_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from litellm.proxy import proxy_server
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import _tinyfish_route_timeout
+
+        monkeypatch.setattr(proxy_server, "general_settings", {"pass_through_request_timeout": 30}, raising=False)
+        assert _tinyfish_route_timeout() is None

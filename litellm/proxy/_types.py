@@ -491,6 +491,7 @@ class LiteLLMRoutes(enum.Enum):
         "/openai_passthrough",
         "/assemblyai",
         "/eu.assemblyai",
+        "/tinyfish",
         "/vllm",
         "/mistral",
         "/typesafe",
@@ -500,6 +501,7 @@ class LiteLLMRoutes(enum.Enum):
         "/watsonx",
         "/nvidia_nim",
         "/deepgram",
+        "/fal_ai",
     ]
 
     #########################################################
@@ -531,6 +533,9 @@ class LiteLLMRoutes(enum.Enum):
     mcp_inference_routes = [
         "/mcp",
         "/mcp/",
+        "/mcp/sse/",
+        "/mcp/sse/messages",
+        "/mcp/sse/messages/",
         "/mcp/proxy",
         "/mcp/{subpath}",
         "/mcp/tools",
@@ -932,6 +937,7 @@ class LiteLLMRoutes(enum.Enum):
         # proxy admin, or team admin naming their own team via team_id
         "/auto_router/test_routing",
         "/auto_router/validate_complexity_router_config",
+        "/auto_router/availability",
         # Per-session auto-router read - the endpoint scopes the row to the caller's own key hash
         "/auto_router/session",
         "/cost/predict-cache",
