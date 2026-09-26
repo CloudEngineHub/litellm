@@ -5,7 +5,7 @@ mod project;
 
 use std::sync::LazyLock;
 
-use host::OcrRouteHost;
+use host::OcrPythonHost;
 use litellm_auth_gcp::VertexAuth;
 use litellm_callbacks_legacy_python::{LegacySurface, PublicCall, run_legacy_call};
 use litellm_core::ocr::{provider_config, route::ocr_machine};
@@ -69,7 +69,8 @@ fn run_ocr(
         if asynchronous { ASYNC_SURFACE } else { SURFACE },
         PublicCall::capture(&request, &args, &kwargs)?,
         crate::logger::LoggedMachine::new(ocr_machine(client)),
-        OcrRouteHost::new(request.unbind()),
+        OcrPythonHost::new(request.unbind()),
+        crate::preflight::sdk_preflight,
         asynchronous,
     )
 }
