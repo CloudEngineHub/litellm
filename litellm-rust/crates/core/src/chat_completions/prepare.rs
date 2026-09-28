@@ -1,19 +1,19 @@
 use litellm_auth::SecretValue;
-use litellm_core_utils::get_llm_provider_logic::{CustomLlmProvider, get_custom_llm_provider};
-use litellm_llms::base_llm::{
-    auth::{ValidatedEnvironment, with_default_headers},
-    chat::transformation::BaseConfig,
-};
+use litellm_core_utils::settings::Lookup;
+use litellm_http::request::with_default_headers;
+use litellm_llms::base_llm::{auth::ValidatedEnvironment, chat::transformation::BaseConfig};
+use litellm_secrets::source::Secrets;
 use litellm_types::llms::openai::ChatMessage;
 use serde_json::Value;
 
 use super::{
     Error,
-    common_utils::{chat_completions_provider_config, string_headers},
+    common_utils::{chat_completions_provider, string_headers},
 };
 use crate::chat_completions::types::{
     ChatCompletionsRequest, ProviderChatCompletionsRequest, ResolvedChatCompletionsRequest,
 };
+use crate::provider::resolve_llm_provider;
 
 pub(super) struct ResolvedProvider {
     pub(super) model: String,
@@ -25,30 +25,24 @@ pub(super) fn resolve_provider_config<'a>(
     model: &'a str,
     custom_llm_provider: Option<&'a str>,
 ) -> Result<ResolvedProvider, Error> {
-    let provider_info = get_custom_llm_provider(model, custom_llm_provider)
-        .or_else(|| {
-            custom_llm_provider.map(|provider| CustomLlmProvider {
-                model,
-                custom_llm_provider: provider,
-            })
-        })
-        .ok_or_else(|| {
-            Error::InvalidProvider(
-                "unable to resolve custom_llm_provider for chat completions request".to_string(),
-            )
-        })?;
-    let config = chat_completions_provider_config(provider_info.custom_llm_provider)
-        .ok_or_else(|| Error::InvalidProvider(provider_info.custom_llm_provider.to_string()))?;
+    let provider_info = resolve_llm_provider(model, custom_llm_provider, "chat completions")?;
+    let config = chat_completions_provider(provider_info.provider)
+        .ok_or_else(|| Error::InvalidProvider(<&str>::from(provider_info.provider).to_string()))?
+        .config();
     Ok(ResolvedProvider {
         model: provider_info.model.to_string(),
-        custom_llm_provider: provider_info.custom_llm_provider.to_string(),
+        custom_llm_provider: <&str>::from(provider_info.provider).to_string(),
         config,
     })
 }
 
 pub(super) fn parse_messages(messages: Value) -> Result<Vec<ChatMessage>, Error> {
-    serde_json::from_value(messages)
-        .map_err(|err| Error::InvalidRequest(format!("invalid chat completions messages: {err}")))
+    serde_json::from_value(messages).map_err(|err| {
+        Error::InvalidRequest(litellm_llms::ErrorDetail::invalid(
+            "chat completions messages",
+            err,
+        ))
+    })
 }
 
 pub(super) fn resolve_request(
@@ -62,7 +56,7 @@ pub(super) fn resolve_request(
     let messages = parse_messages(request.messages)?;
     if messages.is_empty() {
         return Err(Error::InvalidRequest(
-            "chat completions requires at least one message".to_string(),
+            "chat completions requires at least one message".into(),
         ));
     }
     if let Some(reason) = config.unsupported_reason(&messages, &request.optional_params) {
@@ -85,8 +79,9 @@ fn validate_environment(
     request: &ResolvedChatCompletionsRequest<'_>,
     model: &str,
     config: &dyn BaseConfig,
+    secrets: &dyn Lookup,
 ) -> Result<ValidatedEnvironment, Error> {
-    let env_lookup = |key: &str| std::env::var(key).ok();
+    let env_lookup = |key: &str| secrets.get(key);
     let forwarded = string_headers(request.extra_headers.clone())?;
     let validated = config.validate_environment(
         forwarded,
@@ -101,13 +96,16 @@ fn validate_environment(
     })
 }
 
+#[tracing::instrument(name = "litellm.prepare", level = "debug", skip_all)]
 pub(super) fn prepare_provider_request(
     request: ResolvedChatCompletionsRequest<'_>,
+    secrets: Secrets,
 ) -> Result<ProviderChatCompletionsRequest, Error> {
-    let environment = validate_environment(&request, &request.model, request.config)?;
+    let environment =
+        validate_environment(&request, &request.model, request.config, secrets.as_ref())?;
     let model = request.model;
     let config = request.config;
-    let env_lookup = |key: &str| std::env::var(key).ok();
+    let env_lookup = |key: &str| secrets.get(key);
     let url = config.get_complete_url(
         request.api_base,
         &model,
@@ -125,6 +123,7 @@ pub(super) fn prepare_provider_request(
         body: transformed.body,
         optional_params: request.optional_params,
         environment,
+        secrets,
         timeout: request.timeout,
         api_key: request.api_key.map(|key| SecretValue::new(key.to_string())),
     })
@@ -145,7 +144,10 @@ mod tests {
     fn prepare_chat_completions_call(
         request: ChatCompletionsRequest<'_>,
     ) -> Result<ProviderChatCompletionsRequest, Error> {
-        prepare_provider_request(resolve_request(request)?)
+        prepare_provider_request(
+            resolve_request(request)?,
+            std::sync::Arc::new(|_: &str| None),
+        )
     }
 
     /// The headers as they go on the wire, credential applied.
@@ -384,7 +386,11 @@ mod tests {
                 json!([]),
                 json!({}),
             )),
-            Error::InvalidRequest("chat completions requires at least one message".to_string())
+            Error::InvalidRequest(
+                "chat completions requires at least one message"
+                    .to_string()
+                    .into()
+            )
         );
         assert!(matches!(
             decline(request(

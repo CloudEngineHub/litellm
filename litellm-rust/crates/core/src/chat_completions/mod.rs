@@ -1,31 +1,23 @@
-//! The `/chat/completions` call, the Rust equivalent of Python's
-//! `litellm.completion()`.
-//!
-//! [`chat_completions`] is the top-level entrypoint: give it a model, the
-//! OpenAI-shaped message list, the provider-mapped optional params, and
-//! credentials, and it resolves the provider, translates the conversation,
-//! calls the provider, and returns a typed OpenAI-shaped response.
-
+pub mod route;
 pub mod types;
 pub use crate::error::RouteError as Error;
 mod common_utils;
 pub(crate) mod handler;
 mod prepare;
-use litellm_http::{ClientVariant, HttpClientConfig};
 use litellm_types::utils::ChatCompletionsResponse;
 use prepare::{parse_messages, prepare_provider_request, resolve_provider_config, resolve_request};
 use serde_json::{Map, Value};
 
 use crate::chat_completions::types::ChatCompletionsRequest;
+use litellm_auth::AuthServices;
+use litellm_secrets::source::SecretSource;
+use std::sync::Arc;
 
-pub async fn chat_completions(
-    resources: &crate::resources::CoreResources,
-    config: &HttpClientConfig,
-    request: ChatCompletionsRequest<'_>,
-) -> Result<ChatCompletionsResponse, Error> {
-    let http = resources.pool.client(config, ClientVariant::Provider)?;
-    let request = prepare_provider_request(resolve_request(request)?)?;
-    handler::execute(&http, &resources.auth, request, &()).await
+#[derive(Clone)]
+pub struct ChatCompletionsRoute {
+    http: litellm_http::Client,
+    auth: Arc<AuthServices>,
+    secrets: Arc<dyn SecretSource>,
 }
 
 /// Whether the core would accept this request, without resolving credentials or
@@ -53,4 +45,56 @@ pub fn chat_completions_decline_reason(
     config
         .unsupported_reason(&messages, optional_params)
         .map(|reason| reason.0)
+}
+
+impl ChatCompletionsRoute {
+    pub fn new(
+        http: litellm_http::Client,
+        auth: Arc<AuthServices>,
+        secrets: Arc<dyn SecretSource>,
+    ) -> Self {
+        Self {
+            http,
+            auth,
+            secrets,
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        request: ChatCompletionsRequest<'_>,
+        hooks: &impl litellm_host::hooks::RouteHooks<Error>,
+    ) -> Result<ChatCompletionsResponse, Error> {
+        litellm_host::lifecycle::observe_unary(hooks.observer(), self.run(request, hooks)).await
+    }
+
+    #[tracing::instrument(name = "litellm.route", skip_all, fields(
+        route = "chat_completions",
+        model = %request.model,
+        provider,
+        resolved_model,
+        stream = false,
+        outcome
+    ))]
+    async fn run(
+        &self,
+        request: ChatCompletionsRequest<'_>,
+        hooks: &impl litellm_host::hooks::RouteHooks<Error>,
+    ) -> Result<ChatCompletionsResponse, Error> {
+        crate::diagnostic::unary(async {
+            let resolved = resolve_request(request)?;
+            let snapshot = self
+                .secrets
+                .resolve(&resolved.config.secret_names())
+                .await?;
+            let prepared = prepare_provider_request(resolved, snapshot)?;
+            crate::diagnostic::provider(&prepared.model, &prepared.custom_llm_provider);
+            let execute: futures_util::future::BoxFuture<
+                '_,
+                Result<ChatCompletionsResponse, Error>,
+            > = Box::pin(handler::execute(&self.http, &self.auth, prepared, hooks));
+            execute.await
+        })
+        .await
+    }
 }

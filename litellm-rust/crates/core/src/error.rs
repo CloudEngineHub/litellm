@@ -22,9 +22,9 @@ pub enum RouteError {
     #[error("invalid provider: {0}")]
     InvalidProvider(String),
     #[error("invalid request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(#[source] litellm_llms::ErrorDetail),
     #[error("invalid response: {0}")]
-    InvalidResponse(String),
+    InvalidResponse(#[source] litellm_llms::ErrorDetail),
     #[error("unsupported by the rust path: {0}")]
     Unsupported(&'static str),
     #[error(transparent)]
@@ -37,6 +37,8 @@ pub enum RouteError {
     Http(#[from] litellm_http::Error),
     #[error(transparent)]
     Secret(#[from] SecretError),
+    #[error("post-call hook failed: {0}")]
+    PostCallHook(#[source] Arc<RouteError>),
 }
 
 /// Whether the provider had already been called when the route failed. Before the send, a
@@ -47,10 +49,25 @@ pub enum Phase {
     AfterSend,
 }
 
+impl From<litellm_host::machine::MachineFault> for RouteError {
+    fn from(fault: litellm_host::machine::MachineFault) -> Self {
+        use litellm_host::machine::MachineFault;
+        Self::InvalidRequest(match fault {
+            MachineFault::Abandoned => "host driver was abandoned".into(),
+            MachineFault::Protocol(message) => format!("host {message}").into(),
+        })
+    }
+}
+
 impl RouteError {
+    pub(crate) fn post_call(error: Self) -> Self {
+        Self::PostCallHook(Arc::new(error))
+    }
+
     pub fn phase(&self) -> Phase {
         match self {
             Self::InvalidResponse(_)
+            | Self::PostCallHook(_)
             | Self::Transport(TransportError::Http { .. } | TransportError::Network(_)) => {
                 Phase::AfterSend
             }
@@ -78,9 +95,11 @@ impl RouteError {
             | Self::Unsupported(_)
             | Self::Headers(_) => true,
             Self::Auth(error) => !matches!(error, litellm_auth::Error::MissingApiKey { .. }),
-            Self::InvalidResponse(_) | Self::Transport(_) | Self::Http(_) | Self::Secret(_) => {
-                false
-            }
+            Self::InvalidResponse(_)
+            | Self::Transport(_)
+            | Self::Http(_)
+            | Self::Secret(_)
+            | Self::PostCallHook(_) => false,
         }
     }
 }
@@ -126,6 +145,8 @@ impl Eq for SecretError {}
 mod tests {
     use super::{Phase, RouteError};
     use litellm_http::transport::Error as TransportError;
+    use litellm_llms::{Error as LlmError, ErrorDetail};
+    use rstest::rstest;
 
     #[test]
     fn only_a_provider_answer_or_a_lost_connection_counts_as_after_send() {
@@ -162,5 +183,34 @@ mod tests {
         assert!(RouteError::Auth(litellm_auth::Error::InvalidHeader).is_request());
         assert!(RouteError::InvalidRequest("top_k".into()).is_request());
         assert!(!RouteError::InvalidResponse("bad json".into()).is_request());
+    }
+    #[rstest]
+    #[case::request(true, Phase::BeforeSend)]
+    #[case::response(false, Phase::AfterSend)]
+    fn contextual_errors_preserve_sources_and_route_classification(
+        #[case] request: bool,
+        #[case] phase: Phase,
+    ) {
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let source_message = source.to_string();
+        let detail = ErrorDetail::invalid("test payload", source);
+        let error = RouteError::from(if request {
+            LlmError::InvalidRequest(detail)
+        } else {
+            LlmError::InvalidResponse(detail)
+        });
+        assert_eq!(error.phase(), phase);
+        assert_eq!(error.is_request(), request);
+        let category = if request { "request" } else { "response" };
+        assert_eq!(
+            error.to_string(),
+            format!("invalid {category}: invalid test payload: {source_message}")
+        );
+        let source = std::iter::successors(Some(&error as &dyn std::error::Error), |error| {
+            error.source()
+        })
+        .find_map(|error| error.downcast_ref::<serde_json::Error>())
+        .expect("the original JSON error remains available");
+        assert_eq!(source.to_string(), source_message);
     }
 }
