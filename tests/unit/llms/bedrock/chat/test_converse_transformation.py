@@ -523,6 +523,39 @@ def test_reasoning_effort_maps_to_reasoning_effort_for_openai_gpt5_converse(mode
 @pytest.mark.parametrize(
     "model",
     [
+        "us.openai.gpt-5.6-luna",
+        "bedrock/converse/global.openai.gpt-5.6-terra",
+        "us.openai.gpt-6-astra",
+    ],
+)
+def test_openai_gpt5_converse_rejects_effort_level_disabled_in_model_map(model, local_model_cost_map):
+    config = AmazonConverseConfig()
+    assert litellm.utils.is_explicitly_disabled_factory(
+        model=model, custom_llm_provider="bedrock_converse", key="supports_minimal_reasoning_effort"
+    )
+
+    with pytest.raises(litellm.utils.UnsupportedParamsError, match="minimal"):
+        config.map_openai_params(
+            non_default_params={"reasoning_effort": "minimal"},
+            optional_params={},
+            model=model,
+            drop_params=False,
+        )
+
+    optional_params = config.map_openai_params(
+        non_default_params={"reasoning_effort": "minimal"},
+        optional_params={},
+        model=model,
+        drop_params=True,
+    )
+    _, additional_request_params, _, _ = config._prepare_request_params(optional_params, model)
+    assert "reasoning" not in additional_request_params
+    assert "thinking" not in additional_request_params
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
         "us.openai.gpt-5.6-sol",
         "bedrock/converse/global.openai.gpt-5.6-luna",
         "us.openai.gpt-6-astra",
@@ -5736,15 +5769,20 @@ def test_cache_control_injection_tool_config_drops_ttl_for_unsupported_model():
         pytest.param("global.openai.gpt-6-astra", False, id="openai-family-implicit-caching-only"),
         pytest.param("openai.gpt-oss-120b-1:0", False, id="openai-gpt-oss"),
         pytest.param("us.openai.gpt-99-unmapped", False, id="unmapped-openai-family-still-suppressed"),
+        pytest.param("us.moonshotai.kimi-k3", False, id="kimi-k3-prices-cached-tokens-but-rejects-cachepoint"),
+        pytest.param("global.moonshotai.kimi-k3", False, id="kimi-k3-global-profile"),
+        pytest.param("us-east-1/us.moonshotai.kimi-k3", False, id="kimi-k3-regional-route-resolves-through-profile"),
     ],
 )
 def test_cache_points_emitted_only_for_models_that_support_prompt_caching(model, expects_cache_points, monkeypatch):
     """Bedrock rejects cachePoint blocks for models without prompt caching support
-    ("You invoked an unsupported model or your request did not allow prompt caching"),
-    and clients like Claude Code attach cache_control to every request, so a map-known
-    model without the capability must not receive them. Unmapped ids (application
-    inference profile ARNs, models newer than the map) keep emitting so existing
-    caching setups never silently degrade."""
+    ("You invoked an unsupported model or your request did not allow prompt caching")
+    and for models that price cached tokens yet take the marker only on their native
+    endpoints ("This model doesn't support the cachePoint field", Kimi K3), and clients
+    like Claude Code attach cache_control to every request, so a map-known model without
+    the capability must not receive them on system, message, or tool blocks. Unmapped ids
+    (application inference profile ARNs, models newer than the map) keep emitting so
+    existing caching setups never silently degrade."""
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
 
@@ -5754,14 +5792,25 @@ def test_cache_points_emitted_only_for_models_that_support_prompt_caching(model,
             {"role": "system", "content": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]},
             {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]},
         ],
-        optional_params={},
+        optional_params={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}},
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        },
         litellm_params={},
         headers={},
     )
 
-    assert ("cachePoint" in json.dumps(body)) is expects_cache_points
+    assert ("cachePoint" in json.dumps(body["system"])) is expects_cache_points
+    assert ("cachePoint" in json.dumps(body["messages"])) is expects_cache_points
+    assert ("cachePoint" in json.dumps(body["toolConfig"])) is expects_cache_points
     assert body["system"][0]["text"] == "sys"
     assert body["messages"][0]["content"][0]["text"] == "hi"
+    assert body["toolConfig"]["tools"][0]["toolSpec"]["name"] == "get_weather"
 
 
 def test_tool_config_cachepoint_not_placed_or_credited_for_model_without_prompt_caching(monkeypatch):
