@@ -1,7 +1,7 @@
 "use client";
 
 import type { TraceSummary } from "../../types";
-import type { TimeWindow } from "@/components/shared/timeline/Timeline";
+import type { TimeWindow } from "@/components/shared/timeRange/timeRange";
 
 import {
   Combobox,
@@ -22,11 +22,13 @@ interface RunsToolbarProps {
   runs: readonly TraceSummary[];
   /** The range the list shows, for the copied query. */
   range?: TimeWindow;
+  /** The list is reloading for a new range; the search box shows a spinner. */
+  busy?: boolean;
   /** Extra controls (time range, live tail) rendered on the right. */
   children?: React.ReactNode;
 }
 
-export function RunsToolbar({ query, onQueryChange, runs, range, children }: RunsToolbarProps) {
+export function RunsToolbar({ query, onQueryChange, runs, range, busy, children }: RunsToolbarProps) {
   const { agent, status, setAgent, setStatus } = useRunFilterRouting();
   const agents = [...new Set([...runs.flatMap(traceAgentNames), ...(agent ? [agent] : [])])].sort();
   const statuses = [
@@ -35,43 +37,47 @@ export function RunsToolbar({ query, onQueryChange, runs, range, children }: Run
     { value: "error", label: "With errors" },
   ];
   return (
-    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b bg-card p-2">
-      <RunSearch value={query} onChange={onQueryChange} runs={runs} range={range} />
-      <Combobox items={agents} value={agent || null} onValueChange={(name) => setAgent(name ?? "")} autoHighlight>
-        <ComboboxInput
-          aria-label="Filter traces by agent"
-          placeholder="All agents"
-          showClear={!!agent}
-          className="h-8 w-48 text-xs"
-        />
-        <ComboboxContent>
-          <ComboboxEmpty>No matching agents</ComboboxEmpty>
-          <ComboboxList>
-            {(name: string) => (
-              <ComboboxItem key={name} value={name} className="text-xs">
-                {name}
-              </ComboboxItem>
-            )}
-          </ComboboxList>
-        </ComboboxContent>
-      </Combobox>
-      <Select
-        items={statuses}
-        value={status}
-        onValueChange={(value: "all" | "ok" | "error" | null) => value !== null && setStatus(value)}
-      >
-        <SelectTrigger size="sm" className="h-8 min-w-28 text-xs" aria-label="Filter traces by status">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {statuses.map((item) => (
-            <SelectItem key={item.value} value={item.value}>
-              {item.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      {children && <div className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">{children}</div>}
+    <div className="flex shrink-0 flex-col bg-card">
+      <div className="flex min-h-10 flex-wrap items-stretch border-b border-border">
+        <RunSearch value={query} onChange={onQueryChange} runs={runs} range={range} busy={busy} />
+        {children && <div className="ml-auto flex h-10 max-w-full items-stretch">{children}</div>}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+        <Combobox items={agents} value={agent || null} onValueChange={(name) => setAgent(name ?? "")} autoHighlight>
+          <ComboboxInput
+            aria-label="Filter traces by agent"
+            placeholder="All agents"
+            showClear={!!agent}
+            className="h-8 w-48 max-w-full text-xs"
+          />
+          <ComboboxContent>
+            <ComboboxEmpty>No matching agents</ComboboxEmpty>
+            <ComboboxList>
+              {(name: string) => (
+                <ComboboxItem key={name} value={name} className="text-xs">
+                  {name}
+                </ComboboxItem>
+              )}
+            </ComboboxList>
+          </ComboboxContent>
+        </Combobox>
+        <Select
+          items={statuses}
+          value={status}
+          onValueChange={(value: "all" | "ok" | "error" | null) => value !== null && setStatus(value)}
+        >
+          <SelectTrigger size="sm" className="h-8 min-w-28 text-xs" aria-label="Filter traces by status">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {statuses.map((item) => (
+              <SelectItem key={item.value} value={item.value}>
+                {item.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
     </div>
   );
 }
