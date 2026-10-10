@@ -40,33 +40,23 @@ from litellm.proxy.proxy_server import (
     validate_deployment_complexity_router_placement,
     validate_deployment_max_agentic_loops,
 )
-from litellm.tracing.config import trace_storage_config
+from litellm.tracing.config import is_lens_tracing_enabled
 
 from .conftest import normalize
 from tests._master_key import MASTER_KEY
 
 
 @pytest.mark.asyncio
-async def test_proxy_config_loads_tracing_url_and_retention_from_yaml(tmp_path, monkeypatch) -> None:
+async def test_proxy_config_loads_lens_store_from_yaml(tmp_path, monkeypatch) -> None:
     config_file: Final = tmp_path / "tracing.yaml"
-    config_file.write_text(
-        "model_list: []\ngeneral_settings:\n  tracing:\n    store:\n"
-        "      type: clickhouse\n      url: os.environ/TRACING_TEST_URL\n"
-        "      database: analytics\n      retention_days: 7\n"
-    )
-    monkeypatch.setenv("TRACING_TEST_URL", "http://localhost:8123")
-    monkeypatch.setenv("CLICKHOUSE_URL", "http://unused:8123")
+    config_file.write_text("model_list: []\ngeneral_settings:\n  tracing:\n    store:\n      type: lens\n")
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", None)
     monkeypatch.setattr("litellm.proxy.proxy_server.store_model_in_db", False)
     monkeypatch.delenv("LITELLM_CONFIG_BUCKET_NAME", raising=False)
 
     _, _, settings = await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
-    tracing = trace_storage_config(settings["tracing"])
-    assert (tracing.url, tracing.database, tracing.retention_days) == (
-        "http://localhost:8123",
-        "analytics",
-        7,
-    )
+    assert is_lens_tracing_enabled(settings["tracing"], {}) is True
+
 
 
 @pytest.mark.asyncio
@@ -1851,9 +1841,44 @@ def test_ProxyConfig_load_credential_list_returns_items():
     dumped = creds[0].model_dump()
     assert dumped == {
         "credential_name": "openai-key",
+        "display_name": None,
         "credential_info": {"provider": "openai"},
         "credential_values": {"api_key": "sk-x"},
     }
+
+
+def test_ProxyConfig_load_credential_list_tags_every_entry_as_config_defined():
+    creds = ProxyConfig().load_credential_list(
+        {
+            "credential_list": [
+                {"credential_name": "plain", "credential_info": {}, "credential_values": {"api_key": "sk-x"}},
+                {
+                    "credential_name": "claims-db",
+                    "source": "db",
+                    "credential_info": {},
+                    "credential_values": {"api_key": "sk-y"},
+                },
+            ]
+        }
+    )
+    assert [(cred.credential_name, cred.source) for cred in creds] == [("plain", "config"), ("claims-db", "config")]
+
+
+@pytest.mark.parametrize("display_name", [2024, True, "Azure Prod"])
+def test_ProxyConfig_load_credential_list_ignores_a_display_name_set_in_config(display_name):
+    creds = ProxyConfig().load_credential_list(
+        {
+            "credential_list": [
+                {
+                    "credential_name": "azure_cred",
+                    "display_name": display_name,
+                    "credential_info": {},
+                    "credential_values": {"api_key": "sk-x"},
+                }
+            ]
+        }
+    )
+    assert [(cred.credential_name, cred.display_name) for cred in creds] == [("azure_cred", None)]
 
 
 def test_ProxyConfig_load_credential_list_invalid_entry_raises():
@@ -4019,6 +4044,30 @@ async def test_ProxyConfig_get_credentials_reads_from_writer_not_replica(monkeyp
 
     assert CredentialAccessor.get_credential_values("openai-cred") == {"api_key": "sk-from-writer"}
     reader_inner.litellm_credentialstable.find_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ProxyConfig_get_credentials_carries_the_stored_display_name_and_marks_rows_as_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+
+    pc = ProxyConfig()
+    fake_prisma = MagicMock()
+    fake_prisma.db.litellm_credentialstable.find_many = AsyncMock(
+        return_value=[{**_encrypted_credential_row("labeled-cred", "sk-labeled"), "display_name": "Prod OpenAI"}]
+    )
+    _stub_add_deployment_collaborators(monkeypatch, pc, fake_prisma)
+
+    await pc.get_credentials(prisma_client=fake_prisma)
+
+    loaded = CredentialAccessor.find_credential("labeled-cred")
+    assert loaded is not None
+    assert (loaded.display_name, loaded.source, loaded.credential_values) == (
+        "Prod OpenAI",
+        "db",
+        {"api_key": "sk-labeled"},
+    )
 
 
 # ---------------------------------------------------------------------------
