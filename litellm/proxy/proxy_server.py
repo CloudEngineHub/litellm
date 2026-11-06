@@ -2934,7 +2934,11 @@ def configured_max_request_size_mb() -> int | float | None:
 
 
 _ROUTE_MAX_REQUEST_SIZE_MB: Final[Mapping[tuple[str, str], float]] = MappingProxyType(
-    {("POST", "/claude-code/plugins/upload"): 11}
+    {
+        ("POST", "/claude-code/plugins/upload"): 11,
+        ("POST", "/skill-hub/skills/upload"): 11,
+        ("PUT", "/skill-hub/skills/{name}/upload"): 11,
+    }
 )
 
 
@@ -7320,6 +7324,11 @@ class ProxyConfig:
                     MappingProxyType(
                         {"spend_logs_metadata_fields": typed_general_settings["spend_logs_metadata_fields"]}
                     )
+                )
+
+            if "spend_logs_prompt_storage" in general_settings:
+                _ = ConfigGeneralSettings.model_validate(
+                    MappingProxyType({"spend_logs_prompt_storage": typed_general_settings["spend_logs_prompt_storage"]})
                 )
 
             ### PKCE MULTI-INSTANCE PREREQUISITE CHECK ###
