@@ -20,12 +20,15 @@ import CustomerHierarchyNavigation, { useCustomerHierarchyLinks } from "./Custom
 import CustomerHierarchySettings from "./CustomerHierarchySettings";
 import CustomerBudgetGroups from "./CustomerBudgetGroups";
 import CustomerBudgetSummary from "./CustomerBudgetSummary";
+import CustomerMemberSearch from "./CustomerMemberSearch";
 import { customerUsageEntity, isCustomerUsageIdentifier, type CustomerUsageEntity } from "./customerUsageApi";
 import { CustomerSpendCells, CustomerSpendHeaders, CustomerSpendIdentity } from "./CustomerSpendCells";
 import CreateCustomerHierarchyDialog from "./CreateCustomerHierarchyDialog";
 import { customerEntityId, customerEntityLabel, type CreatedCustomerHierarchyEntity } from "./customerHierarchyForms";
 import useCustomerHierarchy, { type CustomerHierarchyContext } from "./useCustomerHierarchy";
 import type { CustomerHierarchyScope } from "./customerHierarchyApi";
+import { customerBudgetLimit } from "./customerBudgetUsage";
+import { CustomerBudgetLimitCell, CustomerBudgetSortHeader } from "./CustomerBudgetColumn";
 
 type Hierarchy = ReturnType<typeof useCustomerHierarchy>;
 const CHILD_HINTS = {
@@ -186,15 +189,12 @@ function HierarchyCreateAction({ hierarchy, selected, scope }: ScopeProps) {
   );
 }
 
-function HierarchyChildTable(props: ScopeProps) {
+function HierarchyChildRows(props: ScopeProps & { childLabel: string; showTeam: boolean }) {
   const { customerHierarchyHref } = useCustomerHierarchyLinks();
   const [movingMember, setMovingMember] = useState<Member | null>(null);
   const { t } = useTranslation();
-  const { hierarchy } = props;
+  const { hierarchy, childLabel, showTeam } = props;
   const { children, childUsage, childTab, page } = hierarchy;
-  const showTeam = childTab === "members" && props.selected.team === null;
-  const hint = showTeam ? "customerPortal.hierarchy.organizationMembersHint" : CHILD_HINTS[childTab];
-  const childLabel = childTab === "teams" ? t("customerPortal.hierarchy.teams") : t("customerPortal.hierarchy.members");
   if (children.isError)
     return (
       <ErrorState
@@ -215,17 +215,13 @@ function HierarchyChildTable(props: ScopeProps) {
     );
   const rows = hierarchyRows(props);
   const pages = Math.max(1, children.data.meta.total_pages);
+  const emptyMembers = hierarchy.memberSearch
+    ? "customerPortal.hierarchy.noMemberMatches"
+    : "customerPortal.hierarchy.emptyMembers";
   const monthly = new Map(childUsage.data?.monthly.map((row) => [row.id, row]));
   const yearly = new Map(childUsage.data?.yearly.map((row) => [row.id, row.spend]));
   return (
     <>
-      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="text-base font-medium tracking-tight">{childLabel}</h2>
-          <p className="mt-1 text-sm text-muted-foreground">{t(hint)}</p>
-        </div>
-        <HierarchyCreateAction hierarchy={hierarchy} selected={props.selected} scope={props.scope} />
-      </div>
       {childUsage.isError && (
         <ErrorState message={extractProxyErrorMessage(childUsage.error)} onRetry={() => void childUsage.refetch()} />
       )}
@@ -236,6 +232,7 @@ function HierarchyChildTable(props: ScopeProps) {
             <TableHead className="pl-0">{t("customerPortal.hierarchy.name")}</TableHead>
             {showTeam && <TableHead>{t("customerPortal.hierarchy.team")}</TableHead>}
             <CustomerSpendHeaders />
+            <CustomerBudgetSortHeader sort={hierarchy.budgetSort} onSort={hierarchy.toggleBudgetSort} />
             <TableHead className="pr-0">
               <span className="sr-only">{t("customerPortal.hierarchy.settings")}</span>
             </TableHead>
@@ -275,6 +272,7 @@ function HierarchyChildTable(props: ScopeProps) {
                   )}
                 </TableCell>
               )}
+              <CustomerBudgetLimitCell limit={customerBudgetLimit(row.entity)} />
               <TableCell className="pr-0 text-right">
                 <div className="flex justify-end gap-2">
                   <a
@@ -321,12 +319,8 @@ function HierarchyChildTable(props: ScopeProps) {
           ))}
           {rows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={showTeam ? 8 : 7} className="py-12 text-center text-sm text-muted-foreground">
-                {t(
-                  childTab === "teams"
-                    ? "customerPortal.hierarchy.emptyTeams"
-                    : "customerPortal.hierarchy.emptyMembers",
-                )}
+              <TableCell colSpan={showTeam ? 9 : 8} className="py-12 text-center text-sm text-muted-foreground">
+                {t(childTab === "teams" ? "customerPortal.hierarchy.emptyTeams" : emptyMembers)}
               </TableCell>
             </TableRow>
           )}
@@ -352,6 +346,34 @@ function HierarchyChildTable(props: ScopeProps) {
           </div>
         </div>
       )}
+    </>
+  );
+}
+
+function HierarchyChildTable(props: ScopeProps) {
+  const { t } = useTranslation();
+  const { hierarchy } = props;
+  const { childTab } = hierarchy;
+  const showTeam = childTab === "members" && props.selected.team === null;
+  const hint = showTeam ? "customerPortal.hierarchy.organizationMembersHint" : CHILD_HINTS[childTab];
+  const childLabel = childTab === "teams" ? t("customerPortal.hierarchy.teams") : t("customerPortal.hierarchy.members");
+  return (
+    <>
+      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-base font-medium tracking-tight">{childLabel}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{t(hint)}</p>
+        </div>
+        <HierarchyCreateAction hierarchy={hierarchy} selected={props.selected} scope={props.scope} />
+      </div>
+      {childTab === "members" && (
+        <CustomerMemberSearch
+          key={props.selected.team?.customer_team_id ?? ""}
+          value={hierarchy.memberSearch}
+          onSearch={hierarchy.setMemberSearch}
+        />
+      )}
+      <HierarchyChildRows {...props} childLabel={childLabel} showTeam={showTeam} />
     </>
   );
 }
