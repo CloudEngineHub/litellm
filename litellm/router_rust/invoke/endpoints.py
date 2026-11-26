@@ -1131,6 +1131,42 @@ def _deployment_call_params(
     return without(params, *caller_only_keys) if caller_only_keys else params
 
 
+def _passthrough_route_model_id(
+    core: EndpointCore, model_name: str, provider: str | None, kwargs: Mapping[str, object]
+) -> str:
+    from litellm.types.utils import LlmProviders
+
+    if provider == LlmProviders.BEDROCK.value:
+        return _bedrock_model_id(model_name)
+    try:
+        stripped, _, _, _ = core.host.invoke("get_llm_provider")(
+            model=model_name,
+            custom_llm_provider=kwargs.get("custom_llm_provider"),
+            api_base=kwargs.get("api_base"),
+        )
+    except Exception:  # noqa: BLE001  # as the Python router: an unresolvable model is used as is
+        return model_name
+    return str(stripped)
+
+
+def _bedrock_model_id(model_name: str) -> str:
+    from urllib.parse import unquote
+
+    from litellm.litellm_core_utils.model_latest_aliases import resolve_model_latest_alias
+    from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+    from litellm.llms.bedrock.common_utils import split_bedrock_region_path
+    from litellm.passthrough.utils import CommonUtils
+    from litellm.types.utils import LlmProviders
+
+    _, model_id = split_bedrock_region_path(model_name)
+    resolved: Final = resolve_model_latest_alias(model_id, LlmProviders.BEDROCK.value)
+    aws_model_id: Final = BaseAWSLLM.get_bedrock_model_id(
+        {}, BaseAWSLLM.get_bedrock_invoke_provider(resolved), resolved
+    )
+    arn: Final = unquote(aws_model_id)
+    return CommonUtils.encode_bedrock_runtime_modelid_arn(arn) if arn.startswith("arn:") else aws_model_id
+
+
 def _generic_attempt(
     core: EndpointCore,
     plan: Plan,
@@ -1157,21 +1193,14 @@ def _generic_attempt(
         caller_only_keys=_caller_only_keys(plan.endpoint),
     )
     model_name: Final = str(data.get("model"))
+    provider: Final = _generic_provider(data)
     endpoint: Final = kwargs.get("endpoint")
     if endpoint:
-        try:
-            stripped, _, _, _ = core.host.invoke("get_llm_provider")(
-                model=model_name,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                api_base=kwargs.get("api_base"),
-            )
-            replacement = str(stripped)  # rebind-ok: rebound as the Python router rebinds it
-        except Exception:  # noqa: BLE001  # as the Python router: an unresolvable model is used as is
-            replacement = model_name  # rebind-ok: rebound as the Python router rebinds it
         kwargs["endpoint"] = (  # rebind-ok: the request kwargs are shaped in place, as the Python router shapes them
-            replace_path_segment(str(endpoint), requested, replacement)
+            replace_path_segment(
+                str(endpoint), requested, _passthrough_route_model_id(core, model_name, provider, kwargs)
+            )
         )
-    provider: Final = _generic_provider(data)
     final: Final = {
         **_deployment_call_params(plan.endpoint, data, kwargs),
         "caching": core.shaping.cache_responses,
@@ -1241,6 +1270,11 @@ def failover_fields(plan: Plan) -> Mapping[str, object]:
 _PYTHON_HANDLER_NAMES: Final[Mapping[str, str]] = MappingProxyType({"acreate_file": "_acreate_file"})
 
 
+def python_handler_name(plan: Plan) -> str:
+    function_name: Final = plan.function_name or plan.host_op
+    return _PYTHON_HANDLER_NAMES.get(function_name, function_name)
+
+
 def scoped_fallback_fields(plan: Plan, request: Mapping[str, object]) -> Mapping[str, object]:
     """A request that creates or names a resource only one provider holds (a file upload, a batch
     on an uploaded file, a fine-tuning job) falls back within its own model group only
@@ -1250,9 +1284,8 @@ def scoped_fallback_fields(plan: Plan, request: Mapping[str, object]) -> Mapping
         references_provider_scoped_resource,
     )
 
-    function_name: Final = plan.function_name or plan.host_op
     handlers: Final = {
-        "original_function": _Handler(_PYTHON_HANDLER_NAMES.get(function_name, function_name)),
+        "original_function": _Handler(python_handler_name(plan)),
         "original_generic_function": _Handler(plan.host_op),
     }
     kwargs: Final = {**request, **handlers}
@@ -2494,6 +2527,7 @@ class RustEndpoints:
         from litellm.litellm_core_utils.routing_common_utils import (
             add_model_file_id_mappings,  # pyright: ignore[reportUnknownVariableType]  # litellm's untyped helpers and request values
         )
+        from litellm.llms.openai.common_utils import CreatedOnSomeDeployments, create_may_already_exist
         from litellm.types.utils import LlmProviders
 
         target_model_names: Final = _TARGET_MODEL_NAMES.validate_python(kwargs.get(_TARGET_MODEL_NAMES_KEY, ()))
@@ -2573,7 +2607,14 @@ class RustEndpoints:
             self.counters.success_calls[model_name] += 1
             return response
 
-        responses: Final = await asyncio.gather(*(create_for(as_dict(d)) for d in deployments))
+        outcomes: Final = await asyncio.gather(*(create_for(as_dict(d)) for d in deployments), return_exceptions=True)
+        failures: Final = tuple(outcome for outcome in outcomes if isinstance(outcome, BaseException))
+        if failures:
+            failure: Final = next((each for each in failures if create_may_already_exist(each)), failures[0])
+            if len(failures) < len(outcomes):
+                raise failure from CreatedOnSomeDeployments(failure)
+            raise failure
+        responses: Final = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
         if len(responses) == 0:
             raise Exception("No healthy deployments found.")  # noqa: TRY002  # as the Python router
         mapping: Final = add_model_file_id_mappings(healthy_deployments=deployments, responses=responses)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]  # deployment records
